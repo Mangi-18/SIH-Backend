@@ -63,7 +63,6 @@ function extractPlaceNameFromUrl(url) {
 
 async function getPlaceIdFromName(name) {
     const apiKey = process.env.SERPAPI_KEY;
-
     const url = `https://serpapi.com/search.json?engine=google_maps&q=${encodeURIComponent(name)}&type=search&hl=en&gl=in&api_key=${apiKey}`;
 
     try {
@@ -75,14 +74,13 @@ async function getPlaceIdFromName(name) {
             return null;
         }
 
-        // Try multiple possible fields
         let placeId = data.place_results?.place_id
-                   || data.local_results?.[0]?.place_id
-                   || data.local_results?.[0]?.gps_coordinates?.place_id;
+                     || data.local_results?.[0]?.place_id
+                     || data.local_results?.[0]?.gps_coordinates?.place_id;
 
         if (!placeId) {
             console.warn(`⚠️ No place_id found for query: "${name}"`);
-            console.log("🔎 FULL SERPAPI RESPONSE DUMP:", JSON.stringify(data, null, 2)); // DEBUG LOG
+            console.log("🔎 FULL SERPAPI RESPONSE DUMP:", JSON.stringify(data, null, 2));
             return null;
         }
 
@@ -95,25 +93,50 @@ async function getPlaceIdFromName(name) {
     }
 }
 
+// THIS IS THE UPDATED FUNCTION
 async function getReviewsFromPlaceId(placeId) {
     const apiKey = process.env.SERPAPI_KEY;
-    const url = `https://serpapi.com/search.json?engine=google_maps_reviews&place_id=${placeId}&api_key=${apiKey}`;
+    // Define the different review sorting methods we want to fetch
+    const reviewSorts = ['newest', 'lowest_rating', 'highest_rating'];
+
+    // Create an array of promises, one for each API call
+    const fetchPromises = reviewSorts.map(sortBy => {
+        const url = `https://serpapi.com/search.json?engine=google_maps_reviews&place_id=${placeId}&sort_by=${sortBy}&api_key=${apiKey}`;
+        return fetch(url).then(res => {
+            if (!res.ok) {
+                console.error(`❌ SerpApi Reviews Error for placeId "${placeId}" with sort "${sortBy}": ${res.status} ${res.statusText}`);
+                return { reviews: [] }; // Return an empty structure on error
+            }
+            return res.json();
+        });
+    });
 
     try {
-        const response = await fetch(url);
-        const data = await response.json();
+        // Wait for all three API calls to complete in parallel
+        const results = await Promise.all(fetchPromises);
 
-        if (!response.ok || data.error) {
-            console.error(`❌ SerpApi Reviews Error for placeId "${placeId}":`, data.error || `${response.status} ${response.statusText}`);
-            return [];
-        }
+        // Combine the reviews from all three calls into a single array
+        const allReviews = results.flatMap(data => data.reviews || []);
+        
+        // Use a Map to remove duplicate reviews, as some might appear in multiple sorts
+        const uniqueReviews = new Map();
+        allReviews.forEach(review => {
+            if (review && review.snippet) {
+                uniqueReviews.set(review.snippet, review);
+            }
+        });
+        
+        console.log(`✅ Fetched a total of ${uniqueReviews.size} unique reviews for placeId: ${placeId}`);
+        
+        // Return an array of just the review text (snippets)
+        return Array.from(uniqueReviews.values()).map(r => r.snippet);
 
-        return data.reviews?.map(r => r.snippet).filter(Boolean) || [];
     } catch (error) {
         console.error("❌ CRITICAL: Failed to fetch or parse reviews JSON from SerpApi:", error);
         return [];
     }
 }
+
 
 // ============================ ROUTES ============================
 app.post('/analyze', async (req, res) => {
@@ -159,6 +182,7 @@ app.post('/analyze', async (req, res) => {
                 sentimentResult = 'negative';
                 analysisSummary.negative++;
             } else {
+                sentimentResult = 'neutral';
                 analysisSummary.neutral++;
             }
             return { text: comment, sentiment: sentimentResult, score: result.score };
