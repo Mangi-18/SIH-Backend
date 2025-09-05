@@ -18,8 +18,10 @@
     "dotenv": "^17.2.2",
     "express": "^4.18.2",
     "mongodb": "^5.9.0",
+    "node-fetch": "^2.7.0",
     "puppeteer": "^21.11.0",
-    "sentiment": "^5.0.2"
+    "sentiment": "^5.0.2",
+    "serpapi": "^2.2.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

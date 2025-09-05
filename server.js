@@ -1,146 +1,207 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const Sentiment = require('sentiment');
-const { MongoClient } = require('mongodb');
-const puppeteer = require('puppeteer');
+const { MongoClient, ObjectId } = require('mongodb');
+const fetch = require('node-fetch');
 
+// ============================ INITIALIZATION ============================
 const sentiment = new Sentiment();
 const app = express();
 
 app.use(cors());
-// Using bodyParser is more explicit for older Express versions, but express.json() is fine too.
 app.use(bodyParser.json());
 
-// ====================================================================================
-// IMPORTANT: Use your MongoDB Atlas connection string here.
-// The code you provided used a local DB, which might not be what you want.
-// ====================================================================================
-const uri = "mongodb+srv://akhilmgen_db_user:V69gKrRUM86KTdbz@cluster0.ihxl5rf.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
-const client = new MongoClient(uri, { useUnifiedTopology: true });
+// ============================ DB & ENV VALIDATION ============================
+if (!process.env.MONGODB_URI) {
+    console.error("❌ FATAL: MONGODB_URI not found in .env file. Exiting.");
+    process.exit(1);
+}
+if (!process.env.SERPAPI_KEY) {
+    console.error("❌ FATAL: SERPAPI_KEY not found in .env file. Exiting.");
+    process.exit(1);
+}
+
+const client = new MongoClient(process.env.MONGODB_URI);
 let db;
 
 async function connectDB() {
-  try {
-    await client.connect();
-    db = client.db("sih_db");
-    console.log("✅ Connected to MongoDB Atlas");
-  } catch (err) {
-    console.error("❌ DB connection error:", err);
-  }
+    try {
+        await client.connect();
+        db = client.db("sentiment_analysis_db");
+        console.log("✅ Connected to MongoDB Atlas");
+    } catch (err) {
+        console.error("❌ DB connection error:", err);
+        process.exit(1);
+    }
 }
 connectDB();
 
-// ====================================================================================
-// WEBSITE SCRAPING CONFIGURATION
-// This is the "brain" of the scraper. To support a new site, just add its
-// specific instructions here.
-// ====================================================================================
-const siteConfigs = {
-  'www.wellkeyhealth.com': {
-    scrape: async (page) => {
-      console.log('Using Wellkey Health scraping logic...');
-      const containerSelector = 'div.testimonial_wrapper';
-      await page.waitForSelector(containerSelector, { timeout: 15000 });
-      
-      const comments = await page.evaluate(() => {
-        const commentElements = Array.from(document.querySelectorAll('div.testimonial_content p'));
-        return commentElements.map(el => el.innerText.trim());
-      });
-      return comments;
+// ============================ HELPERS ============================
+const isUrl = (string) => {
+    try {
+        new URL(string);
+        return true;
+    } catch (_) {
+        return false;
     }
-  },
-  'www.apollo247.com': {
-    scrape: async (page) => {
-      console.log('Using Apollo 247 scraping logic...');
-      const containerSelector = 'div[data-testid="pdp-review-item-main-div"]';
-      await page.waitForSelector(containerSelector, { timeout: 15000 });
-
-      const comments = await page.evaluate((selector) => {
-        const reviewContainers = Array.from(document.querySelectorAll(selector));
-        return reviewContainers.map(container => {
-          const textEl = container.querySelector('p');
-          return textEl ? textEl.innerText.trim() : '';
-        });
-      }, containerSelector);
-      return comments;
-    }
-  }
 };
 
+function extractPlaceNameFromUrl(url) {
+    try {
+        const decoded = decodeURIComponent(url);
+        const match = decoded.match(/\/place\/([^/]+)/);
+        if (match && match[1]) {
+            return match[1].replace(/\+/g, " ");
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
 
-// ====================================================================================
-// THE MAIN ANALYZE ROUTE
-// This route identifies the website from the URL and uses the correct
-// scraping function from the `siteConfigs` object above.
-// ====================================================================================
+async function getPlaceIdFromName(name) {
+    const apiKey = process.env.SERPAPI_KEY;
+
+    const url = `https://serpapi.com/search.json?engine=google_maps&q=${encodeURIComponent(name)}&type=search&hl=en&gl=in&api_key=${apiKey}`;
+
+    try {
+        const response = await fetch(url);
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+            console.error(`❌ SerpApi Error for query "${name}":`, data.error || `${response.status} ${response.statusText}`);
+            return null;
+        }
+
+        // Try multiple possible fields
+        let placeId = data.place_results?.place_id
+                   || data.local_results?.[0]?.place_id
+                   || data.local_results?.[0]?.gps_coordinates?.place_id;
+
+        if (!placeId) {
+            console.warn(`⚠️ No place_id found for query: "${name}"`);
+            console.log("🔎 FULL SERPAPI RESPONSE DUMP:", JSON.stringify(data, null, 2)); // DEBUG LOG
+            return null;
+        }
+
+        console.log(`✅ Found placeId for "${name}": ${placeId}`);
+        return placeId;
+
+    } catch (error) {
+        console.error("❌ CRITICAL: Failed to fetch or parse JSON from SerpApi:", error);
+        return null;
+    }
+}
+
+async function getReviewsFromPlaceId(placeId) {
+    const apiKey = process.env.SERPAPI_KEY;
+    const url = `https://serpapi.com/search.json?engine=google_maps_reviews&place_id=${placeId}&api_key=${apiKey}`;
+
+    try {
+        const response = await fetch(url);
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+            console.error(`❌ SerpApi Reviews Error for placeId "${placeId}":`, data.error || `${response.status} ${response.statusText}`);
+            return [];
+        }
+
+        return data.reviews?.map(r => r.snippet).filter(Boolean) || [];
+    } catch (error) {
+        console.error("❌ CRITICAL: Failed to fetch or parse reviews JSON from SerpApi:", error);
+        return [];
+    }
+}
+
+// ============================ ROUTES ============================
 app.post('/analyze', async (req, res) => {
-  const { url } = req.body;
-  if (!url) {
-    return res.status(400).json({ message: "URL is required" });
-  }
-
-  let hostname;
-  try {
-    hostname = new URL(url).hostname;
-  } catch (error) {
-    return res.status(400).json({ message: "Invalid URL format" });
-  }
-
-  const config = siteConfigs[hostname];
-
-  if (!config) {
-    return res.status(400).json({ message: `Scraping is not supported for the website: ${hostname}` });
-  }
-
-  let browser;
-  try {
-    console.log(`Attempting to scrape URL: ${url} with config for ${hostname}`);
-    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 }); // Increased timeout for slow pages
-
-    const comments = await config.scrape(page);
-    await browser.close();
-
-    const filteredComments = comments.filter(text => text && text.length > 10);
-
-    if (filteredComments.length === 0) {
-      return res.status(404).json({ message: "No valid comments were found on the page." });
+    const { input } = req.body;
+    if (!input || typeof input !== 'string' || input.trim() === '') {
+        return res.status(400).send({ message: "Input is required and must be a non-empty string." });
     }
 
-    const analyzedComments = filteredComments.map(comment => {
-      const result = sentiment.analyze(comment);
-      let sentimentResult = 'neutral';
-      if (result.score > 0) sentimentResult = 'positive';
-      else if (result.score < 0) sentimentResult = 'negative';
-      return { text: comment, sentiment: sentimentResult };
-    });
+    try {
+        let placeName;
+        if (isUrl(input)) {
+            placeName = extractPlaceNameFromUrl(input);
+            if (!placeName) {
+                return res.status(400).send({ message: "Could not extract a valid place name from the provided URL." });
+            }
+        } else {
+            placeName = input;
+        }
 
-    const newUrlAnalysis = { url, analyzedComments, timestamp: new Date() };
-    const dbResponse = await db.collection("urls").insertOne(newUrlAnalysis);
-    res.status(201).json({ _id: dbResponse.insertedId, ...newUrlAnalysis });
+        const placeId = await getPlaceIdFromName(placeName);
+        if (!placeId) {
+            return res.status(404).send({ message: `Could not find a location for "${placeName}". Check logs for full SerpApi response.` });
+        }
 
-  } catch (err) {
-    console.error(`Error scraping ${url}:`, err);
-    if (browser) await browser.close();
-    res.status(500).json({ message: "An error occurred during scraping. The page structure may have changed, the URL is invalid, or the connection timed out." });
-  }
+        const cachedResult = await db.collection("analyses").findOne({ placeId });
+        if (cachedResult) {
+            console.log(`✅ Returning cached result for placeId: ${placeId}`);
+            return res.status(200).json(cachedResult);
+        }
+
+        const comments = await getReviewsFromPlaceId(placeId);
+
+        let analysisSummary = { positive: 0, negative: 0, neutral: 0, total: comments.length, overallScore: 0 };
+        const analyzedComments = comments.map(comment => {
+            const result = sentiment.analyze(comment);
+            analysisSummary.overallScore += result.score;
+            let sentimentResult = 'neutral';
+
+            if (result.score > 0) {
+                sentimentResult = 'positive';
+                analysisSummary.positive++;
+            } else if (result.score < 0) {
+                sentimentResult = 'negative';
+                analysisSummary.negative++;
+            } else {
+                analysisSummary.neutral++;
+            }
+            return { text: comment, sentiment: sentimentResult, score: result.score };
+        });
+
+        let overallSentiment = 'neutral';
+        if (analysisSummary.total > 0) {
+            const averageScore = analysisSummary.overallScore / analysisSummary.total;
+            if (averageScore > 0.5) overallSentiment = 'positive';
+            else if (averageScore < -0.5) overallSentiment = 'negative';
+        }
+
+        analysisSummary.overallSentiment = comments.length > 0 ? overallSentiment : 'no_reviews';
+
+        const newAnalysis = {
+            input,
+            placeName,
+            placeId,
+            analysis: analysisSummary,
+            analyzedComments,
+            timestamp: new Date(),
+        };
+
+        const dbResponse = await db.collection("analyses").insertOne(newAnalysis);
+        res.status(201).send({ _id: dbResponse.insertedId, ...newAnalysis });
+
+    } catch (err) {
+        console.error("❌ Unhandled error in /analyze route:", err);
+        res.status(500).send({ message: "An internal server error occurred.", error: err.message });
+    }
 });
 
-
-// GET route to fetch all previous analyses
-app.get('/analyze', async (req, res) => {
-  try {
-    const urls = await db.collection("urls").find().sort({ timestamp: -1 }).toArray();
-    res.json(urls);
-  } catch (err) {
-    res.status(500).json({ message: "DB error" });
-  }
+app.get('/analyses', async (req, res) => {
+    try {
+        const analyses = await db.collection("analyses").find().sort({ timestamp: -1 }).toArray();
+        res.status(200).json(analyses);
+    } catch (err) {
+        res.status(500).send({ message: "Database error while fetching analyses.", error: err.message });
+    }
 });
 
-const PORT = 5000;
+// ============================ START SERVER ============================
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
